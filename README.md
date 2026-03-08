@@ -25,31 +25,71 @@ When an LLM uses MCP tools or OpenAPI endpoints natively, every tool definition 
 
 mcp2cli replaces that with a single shell command pattern. The LLM discovers tools on-demand with `--list` and `--help`, paying only for what it actually uses.
 
-**Measured token costs** (cl100k_base tokenizer):
+#### Per-turn cost (system prompt overhead)
 
-| Scenario | Native tool injection | mcp2cli | Reduction |
+Every API turn includes tool definitions (native) or a single CLI instruction (mcp2cli).
+
+| Scenario | Native (tokens/turn) | mcp2cli (tokens/turn) | Reduction |
 |---|--:|--:|--:|
-| Small MCP server (11 tools) | 1,499 | 59 | **96%** |
-| Medium OpenAPI (20 endpoints) | 3,076 | 59 | **98%** |
-| Large API (50 endpoints) | 8,202 | 59 | **99%** |
-| Enterprise API (200+ endpoints) | 32,808 | 59 | **>99%** |
+| Small MCP server (3 tools) | 203 | 67 | **67%** |
+| Petstore API (5 endpoints) | 358 | 67 | **81%** |
+| Medium API (20 endpoints) | 1,430 | 67 | **95%** |
+| Large API (50 endpoints) | 3,579 | 67 | **98%** |
+| Enterprise API (200 endpoints) | 14,316 | 67 | **>99%** |
 
-The **59-token** mcp2cli cost is the one-time system prompt instruction telling the LLM how to use the CLI. On-demand discovery adds ~13 tokens per tool (`--list`) or ~25-50 tokens per command (`--help`), loaded only when needed — not on every turn.
+The **67-token** mcp2cli cost is the system prompt instruction telling the LLM how to use the CLI. Native cost is ~72 tokens per endpoint/tool (measured with cl100k_base on realistic schemas including descriptions, types, enums, and required fields).
 
-**Native approach** (all tools in context on every request):
+#### Full conversation cost
+
+Token savings compound over a multi-turn conversation. Here's the total context token cost including discovery and tool call outputs:
+
+| Scenario | Turns | Tool calls | Native total | mcp2cli total | Saved |
+|---|--:|--:|--:|--:|--:|
+| Petstore (5 endpoints) | 10 | 5 | 3,730 | 839 | **77%** |
+| Medium API (20 endpoints) | 15 | 8 | 21,720 | 1,305 | **94%** |
+| Large API (50 endpoints) | 20 | 12 | 71,940 | 1,850 | **97%** |
+| Enterprise API (200 endpoints) | 25 | 15 | 358,425 | 2,725 | **99%** |
+
+#### Turn-by-turn breakdown (50-endpoint API)
+
+Shows how tokens accumulate over a 10-turn conversation with 4 tool calls:
+
 ```
-System prompt: "You have access to these 50 tools: [8,202 tokens of JSON schemas]"
--> 8,202 tokens consumed per request, regardless of usage
+Turn   Native       mcp2cli      Savings
+──────────────────────────────────────────
+1      3,579        217          3,362       ← mcp2cli: discovery (--list)
+2      7,158        284          6,874
+3      10,767       381          10,386      ← both: tool call output
+4      14,346       448          13,898
+5      17,955       545          17,410      ← both: tool call output
+6      21,534       612          20,922
+7      25,143       709          24,434      ← both: tool call output
+8      28,722       776          27,946
+9      32,331       873          31,458      ← both: tool call output
+10     35,910       940          34,970
+
+Total: 34,970 tokens saved (97.4%)
 ```
 
-**mcp2cli approach** (discover on demand):
+#### How it works
+
+**Native approach** — all tool schemas in context on every turn:
 ```
-System prompt: "Use mcp2cli --spec <url> <command> [--flags] to call the API." (59 tokens)
--> LLM runs: mcp2cli --spec <url> --list                          (649 tokens, once)
--> LLM runs: mcp2cli --spec <url> create-pet --name Rex           (0 extra context tokens)
+System prompt: "You have these 50 tools: [3,579 tokens of JSON schemas]"
+→ 3,579 tokens consumed per turn, regardless of usage
+→ Over 10 turns: 35,910 tokens
 ```
 
-For a 50-endpoint API over a 20-turn conversation, that's **~164,000 tokens saved** (8,202 x 20 vs 59 x 20 + 649).
+**mcp2cli approach** — discover on demand:
+```
+System prompt: "Use mcp2cli --spec <url> <command> [--flags]"  (67 tokens/turn)
+→ LLM runs: mcp2cli --spec <url> --list                       (65 tokens, once)
+→ LLM runs: mcp2cli --spec <url> create-pet --help             (78 tokens, once)
+→ LLM runs: mcp2cli --spec <url> create-pet --name Rex        (0 extra tokens)
+→ Over 10 turns: 940 tokens
+```
+
+These numbers are verified by `tests/test_token_savings.py` using the cl100k_base tokenizer against real schemas.
 
 ## Install
 

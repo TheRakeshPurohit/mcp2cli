@@ -15,7 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 mcp = ["mcp>=1.0"]
-test = ["pytest", "pytest-asyncio", "mcp>=1.0"]
+test = ["pytest", "pytest-asyncio", "mcp>=1.0", "tiktoken"]
 
 [project.scripts]
 mcp2cli = "mcp2cli:main"
