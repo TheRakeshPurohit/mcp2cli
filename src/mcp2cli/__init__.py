@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 
 import argparse
 import copy
@@ -573,17 +573,18 @@ def run_mcp_http(
     ttl: int,
     refresh: bool,
     toon: bool = False,
+    transport: str = "auto",
 ):
 
     import anyio
 
     async def _run():
         from mcp import ClientSession
-        from mcp.client.streamable_http import streamablehttp_client
 
         headers = dict(auth_headers)
 
-        try:
+        async def _with_streamable():
+            from mcp.client.streamable_http import streamablehttp_client
             async with streamablehttp_client(url, headers=headers) as (read, write, _):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
@@ -591,10 +592,9 @@ def run_mcp_http(
                         session, tool_name, arguments, list_mode, pretty, raw,
                         cache_key, ttl, refresh, toon=toon,
                     )
-        except Exception:
-            # Fall back to SSE
-            from mcp.client.sse import sse_client
 
+        async def _with_sse():
+            from mcp.client.sse import sse_client
             async with sse_client(url, headers=headers) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
@@ -602,6 +602,16 @@ def run_mcp_http(
                         session, tool_name, arguments, list_mode, pretty, raw,
                         cache_key, ttl, refresh, toon=toon,
                     )
+
+        if transport == "sse":
+            return await _with_sse()
+        elif transport == "streamable":
+            return await _with_streamable()
+        else:  # auto
+            try:
+                return await _with_streamable()
+            except Exception:
+                return await _with_sse()
 
     anyio.run(_run)
 
@@ -653,13 +663,12 @@ async def _mcp_session(
     refresh: bool,
     toon: bool = False,
 ):
-    result = await session.list_tools()
-    tools = [
-        {"name": t.name, "description": t.description or "", "inputSchema": t.inputSchema or {}}
-        for t in result.tools
-    ]
-
     if list_mode:
+        result = await session.list_tools()
+        tools = [
+            {"name": t.name, "description": t.description or "", "inputSchema": t.inputSchema or {}}
+            for t in result.tools
+        ]
         commands = extract_mcp_commands(tools)
         print("\nAvailable tools:")
         list_mcp_commands(commands)
@@ -701,6 +710,7 @@ def handle_mcp(
     ttl: int,
     refresh: bool,
     toon: bool = False,
+    transport: str = "auto",
 ):
 
 
@@ -710,7 +720,7 @@ def handle_mcp(
         if is_stdio:
             run_mcp_stdio(source, env_vars, None, None, True, pretty, raw, key, ttl, refresh, toon=toon)
         else:
-            run_mcp_http(source, auth_headers, None, None, True, pretty, raw, key, ttl, refresh, toon=toon)
+            run_mcp_http(source, auth_headers, None, None, True, pretty, raw, key, ttl, refresh, toon=toon, transport=transport)
         return
 
     # We need tool list to build argparse, try cache first
@@ -722,7 +732,7 @@ def handle_mcp(
         tools = cached_tools
     else:
         # Must connect to get tool list
-        tools = _fetch_mcp_tools(source, is_stdio, auth_headers, env_vars)
+        tools = _fetch_mcp_tools(source, is_stdio, auth_headers, env_vars, transport=transport)
         save_cache(f"{key}_tools", tools)
 
     commands = extract_mcp_commands(tools)
@@ -760,7 +770,7 @@ def handle_mcp(
     else:
         run_mcp_http(
             source, auth_headers, cmd.tool_name, arguments, False,
-            pretty, raw, key, ttl, refresh, toon=toon,
+            pretty, raw, key, ttl, refresh, toon=toon, transport=transport,
         )
 
 
@@ -769,10 +779,18 @@ def _fetch_mcp_tools(
     is_stdio: bool,
     auth_headers: list[tuple[str, str]],
     env_vars: dict[str, str],
+    transport: str = "auto",
 ) -> list[dict]:
     import anyio
 
     tools_result: list[dict] = []
+
+    async def _extract_tools(session):
+        result = await session.list_tools()
+        tools_result.extend(
+            {"name": t.name, "description": t.description or "", "inputSchema": t.inputSchema or {}}
+            for t in result.tools
+        )
 
     async def _run():
         nonlocal tools_result
@@ -787,42 +805,35 @@ def _fetch_mcp_tools(
             async with stdio_client(params) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
-                    result = await session.list_tools()
-                    tools_result.extend(
-                        {"name": t.name, "description": t.description or "", "inputSchema": t.inputSchema or {}}
-                        for t in result.tools
-                    )
+                    await _extract_tools(session)
         else:
             from mcp import ClientSession
 
             headers = dict(auth_headers)
-            connected = False
-            try:
-                from mcp.client.streamable_http import streamablehttp_client
 
+            async def _via_streamable():
+                from mcp.client.streamable_http import streamablehttp_client
                 async with streamablehttp_client(source, headers=headers) as (read, write, _):
                     async with ClientSession(read, write) as session:
                         await session.initialize()
-                        result = await session.list_tools()
-                        tools_result.extend(
-                            {"name": t.name, "description": t.description or "", "inputSchema": t.inputSchema or {}}
-                            for t in result.tools
-                        )
-                        connected = True
-            except Exception:
-                pass
+                        await _extract_tools(session)
 
-            if not connected:
+            async def _via_sse():
                 from mcp.client.sse import sse_client
-
                 async with sse_client(source, headers=headers) as (read, write):
                     async with ClientSession(read, write) as session:
                         await session.initialize()
-                        result = await session.list_tools()
-                        tools_result.extend(
-                            {"name": t.name, "description": t.description or "", "inputSchema": t.inputSchema or {}}
-                            for t in result.tools
-                        )
+                        await _extract_tools(session)
+
+            if transport == "sse":
+                await _via_sse()
+            elif transport == "streamable":
+                await _via_streamable()
+            else:  # auto
+                try:
+                    await _via_streamable()
+                except Exception:
+                    await _via_sse()
 
     anyio.run(_run)
     return tools_result
@@ -860,6 +871,12 @@ def main():
             "list-users) and 15-20%% for semi-uniform data. Best for LLM consumption "
             "of large result sets. Requires @toon-format/cli (npm install -g @toon-format/cli)."
         ),
+    )
+    pre.add_argument(
+        "--transport",
+        choices=["auto", "sse", "streamable"],
+        default="auto",
+        help="MCP HTTP transport: 'auto' tries streamable then SSE, 'sse' skips streamable, 'streamable' skips SSE fallback",
     )
     pre.add_argument(
         "--env",
@@ -919,6 +936,7 @@ def main():
             pre_args.cache_ttl,
             pre_args.refresh,
             toon=pre_args.toon,
+            transport=pre_args.transport,
         )
         return
 

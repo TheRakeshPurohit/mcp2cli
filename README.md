@@ -44,6 +44,9 @@ mcp2cli --mcp https://mcp.example.com/sse search --query "test"
 # With auth header
 mcp2cli --mcp https://mcp.example.com/sse --auth-header "x-api-key:sk-..." \
   query --sql "SELECT 1"
+
+# Force a specific transport (skip streamable HTTP fallback dance)
+mcp2cli --mcp https://mcp.example.com/sse --transport sse --list
 ```
 
 ### MCP stdio mode
@@ -130,6 +133,7 @@ Source (mutually exclusive, one required):
 Options:
   --auth-header K:V     HTTP header (repeatable)
   --base-url URL        Override base URL from spec
+  --transport TYPE      MCP HTTP transport: auto|sse|streamable (default: auto)
   --env KEY=VALUE       Env var for MCP stdio server (repeatable)
   --cache-key KEY       Custom cache key
   --cache-ttl SECONDS   Cache TTL (default: 3600)
