@@ -13,10 +13,11 @@
 ## Install
 
 ```bash
-pip install mcp2cli
-
-# Or run directly without installing
+# Run directly without installing
 uvx mcp2cli --help
+
+# Or install globally
+uv tool install mcp2cli
 ```
 
 ## AI Agent Skill
