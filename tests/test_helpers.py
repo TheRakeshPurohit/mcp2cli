@@ -620,14 +620,20 @@ class _FakePage:
 
 
 class _FakeSession:
-    """Fake MCP session whose list_tools() serves canned pages, keyed by cursor."""
+    """Fake MCP session whose list_tools() serves canned pages, keyed by cursor.
+
+    Mirrors the real signature: both SDK majors take pagination as
+    ``params=PaginatedRequestParams(...)``; v1's ``cursor=`` shorthand is
+    deprecated and v2 removed it.
+    """
 
     def __init__(self, pages):
         # pages: list of (cursor_expected, _FakePage) in order
         self._pages = pages
         self.calls = []
 
-    async def list_tools(self, cursor=None):
+    async def list_tools(self, *, params=None):
+        cursor = params.cursor if params is not None else None
         self.calls.append(cursor)
         expected_cursor, page = self._pages[len(self.calls) - 1]
         assert cursor == expected_cursor, (

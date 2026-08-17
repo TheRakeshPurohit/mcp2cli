@@ -11,6 +11,24 @@ import pytest
 import mcp2cli
 
 
+def _sdk_httpx():
+    """The httpx flavour the installed SDK is built on (v2 uses httpx2)."""
+    from mcp.shared import _httpx_utils
+
+    return getattr(_httpx_utils, "httpx2", None) or _httpx_utils.httpx
+
+
+def _code_state(result):
+    """Normalize a callback_handler result across SDK majors.
+
+    v1 returns a plain ``(code, state)`` tuple; v2 returns an
+    ``AuthorizationCodeResult`` model.
+    """
+    if isinstance(result, tuple):
+        return result
+    return (result.code, result.state)
+
+
 class TestResolveSecret:
     """Tests for resolve_secret helper."""
 
@@ -1120,7 +1138,7 @@ class TestManualCallbackProvider:
         monkeypatch.setattr(
             sys, "stdin", io.StringIO("http://127.0.0.1:1/callback?code=zz&state=yy\n")
         )
-        assert anyio.run(provider.context.callback_handler) == ("zz", "yy")
+        assert _code_state(anyio.run(provider.context.callback_handler)) == ("zz", "yy")
 
     def test_manual_redirect_handler_prints_url_and_skips_browser(
         self, tmp_path, monkeypatch, capsys
@@ -1166,7 +1184,8 @@ class TestManualCallbackEndToEnd:
 
     def test_pasted_callback_completes_token_exchange(self, tmp_path, monkeypatch):
         import anyio
-        import httpx
+
+        httpx = _sdk_httpx()
 
         monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
         provider = mcp2cli.build_oauth_provider(

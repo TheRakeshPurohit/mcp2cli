@@ -255,35 +255,6 @@ class TestMCPStdioJson:
 
 
 class TestMCPHttpJson:
-    @pytest.fixture(scope="class")
-    def mcp_http_server(self):
-        import time
-
-        server_script = Path(__file__).parent / "_mcp_http_server.py"
-        proc = subprocess.Popen(
-            [sys.executable, str(server_script)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        port = None
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            line = proc.stdout.readline().strip()
-            if line.startswith("PORT="):
-                port = int(line.split("=")[1])
-                break
-            if proc.poll() is not None:
-                pytest.skip(f"MCP HTTP server failed: {proc.stderr.read()}")
-                return
-        if port is None:
-            proc.kill()
-            pytest.skip("MCP HTTP server did not report port in time")
-            return
-        yield f"http://127.0.0.1:{port}/sse"
-        proc.terminate()
-        proc.wait(timeout=5)
-
     def _run(self, url, *args):
         cmd = [sys.executable, "-m", "mcp2cli", "--mcp", url, *args]
         return subprocess.run(cmd, capture_output=True, text=True, timeout=30)

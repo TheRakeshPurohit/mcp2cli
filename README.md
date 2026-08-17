@@ -364,12 +364,26 @@ Subcommands and their flags are generated dynamically from the spec or MCP serve
 # Install with test + MCP deps
 uv sync --extra test
 
-# Run tests (96 tests covering OpenAPI, MCP stdio, MCP HTTP, caching, and token savings)
+# Run tests
 uv run pytest tests/ -v
 
 # Run just the token savings tests
 uv run pytest tests/test_token_savings.py -v -s
 ```
+
+### MCP SDK compatibility
+
+mcp2cli works with **both major versions** of the MCP Python SDK (`mcp>=1.26,<3`),
+so it never forces a resolver conflict with other tools in the same environment.
+CI runs the suite against the declared floor, the latest 1.x, and the latest 2.x.
+
+The two majors differ in ways that matter to a client — v2 renamed model fields
+to snake_case, replaced `streamablehttp_client`, moved to `httpx2`, and dropped
+the session-id element from the transport tuple. Those differences are confined
+to a handful of helpers (`_mcp_attr`, `_mcp_dump`, `_streamable_streams`,
+`_list_tools_page`, `_resource_uri`, `_authorization_code_result`); the rest of
+the codebase is version-agnostic. The test fixtures speak the JSON-RPC wire
+protocol directly and import no SDK, so they hold across majors.
 
 ---
 

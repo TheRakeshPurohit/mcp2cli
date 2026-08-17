@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 import webbrowser
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -279,6 +280,125 @@ def _toon_encode(json_str: str) -> str | None:
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
     return None
+
+
+# ---------------------------------------------------------------------------
+# MCP SDK compatibility (v1 and v2)
+# ---------------------------------------------------------------------------
+
+# SDK 2.0 renamed model fields from camelCase to snake_case, keeping camelCase
+# only as serialization aliases -- so attribute access has to use the new name
+# while the wire format is unchanged. A name missing from this map is an
+# unhandled rename and raises KeyError rather than silently reading None.
+_MCP_RENAMED_FIELDS = {
+    "inputSchema": "input_schema",
+    "outputSchema": "output_schema",
+    "nextCursor": "next_cursor",
+    "resourceTemplates": "resource_templates",
+    "uriTemplate": "uri_template",
+    "mimeType": "mime_type",
+    "structuredContent": "structured_content",
+    "isError": "is_error",
+}
+
+
+def _mcp_attr(obj, name: str):
+    """Read an SDK model field across the v1/v2 camelCase -> snake_case rename."""
+    try:
+        return getattr(obj, name)
+    except AttributeError:
+        return getattr(obj, _MCP_RENAMED_FIELDS[name])
+
+
+def _demote_meta_alias(node: dict) -> None:
+    """Emit the SDK's ``_meta`` alias as ``meta``, the spelling mcp2cli ships."""
+    if "_meta" in node:
+        node["meta"] = node.pop("_meta")
+
+
+def _mcp_dump(model) -> dict:
+    """Serialize an SDK model using the camelCase wire names on either major.
+
+    v2 renamed model attributes to snake_case, so a plain ``model_dump()``
+    would silently change mcp2cli's ``--json`` envelope from ``isError`` to
+    ``is_error`` depending on which SDK happened to be installed. ``by_alias``
+    pins the wire spelling on both.
+
+    ``meta`` is aliased to ``_meta`` in both majors, and mcp2cli has always
+    emitted it as ``meta``, so it is mapped back -- but only on the envelope
+    and its content items, which the SDK owns. ``structuredContent`` is the
+    tool's own payload and is never rewritten, so a tool that legitimately
+    returns a ``_meta`` key keeps it.
+    """
+    data = model.model_dump(mode="json", by_alias=True)
+    _demote_meta_alias(data)
+    for item in data.get("content") or ():
+        if isinstance(item, dict):
+            _demote_meta_alias(item)
+    return data
+
+
+def _resource_uri(uri: str):
+    """Coerce a resource URI to what ``resources/read`` expects.
+
+    v1 types the request param as a pydantic ``AnyUrl``; v2 takes a plain
+    string and rejects an ``AnyUrl``.
+    """
+    from mcp.types import ReadResourceRequestParams
+
+    if ReadResourceRequestParams.model_fields["uri"].annotation is str:
+        return uri
+    from pydantic import AnyUrl
+
+    return AnyUrl(uri)
+
+
+@asynccontextmanager
+async def _streamable_streams(url: str, headers=None, auth=None):
+    """Open a streamable-http transport, yielding ``(read, write)``.
+
+    Three things differ across SDK majors here, which is why this is the only
+    place that talks to that transport (issues #68, #74):
+
+    * v2 dropped the ``streamablehttp_client`` alias, keeping only
+      ``streamable_http_client`` -- the original break.
+    * that surviving function takes a pre-built ``http_client`` instead of
+      ``headers``/``auth``, and v2 is built on **httpx2**, not httpx, so the
+      client has to come from the SDK's own factory to be the right flavour.
+    * v1 yields a third element (a get-session-id callback) that v2 dropped.
+      mcp2cli never used it, so both shapes collapse to ``(read, write)``.
+    """
+    from mcp.client.streamable_http import streamable_http_client
+    from mcp.shared._httpx_utils import create_mcp_http_client
+
+    async with create_mcp_http_client(headers=headers, auth=auth) as client:
+        async with streamable_http_client(url, http_client=client) as streams:
+            yield streams[0], streams[1]
+
+
+async def _list_tools_page(session, cursor: str | None):
+    """Request one page of ``tools/list``.
+
+    Both majors accept ``params``; v1's ``cursor=`` shorthand is deprecated
+    there and gone in v2, so this is the one spelling that works on both.
+    """
+    from mcp.types import PaginatedRequestParams
+
+    params = PaginatedRequestParams(cursor=cursor) if cursor else None
+    return await session.list_tools(params=params)
+
+
+def _authorization_code_result(code: str, state: str | None):
+    """Wrap a callback result in whatever ``callback_handler`` must return.
+
+    v1 expects a plain ``(code, state)`` tuple; v2 expects an
+    ``AuthorizationCodeResult`` model.
+    """
+    try:
+        from mcp.shared.auth import AuthorizationCodeResult
+    except ImportError:
+        return (code, state)
+    return AuthorizationCodeResult(code=code, state=state)
 
 
 def _ensure_utf8_output() -> None:
@@ -877,12 +997,21 @@ def build_oauth_provider(
                 await super()._initialize()
                 _restore_token_expiry_from_sidecar(self.context)
 
+        # v2 renamed the `scopes` argument to `scope`.
+        import inspect
+
+        scope_kwarg = (
+            "scope"
+            if "scope"
+            in inspect.signature(ClientCredentialsOAuthProvider.__init__).parameters
+            else "scopes"
+        )
         return _RobustClientCredentialsProvider(
             server_url=server_url,
             storage=storage,
             client_id=client_id,
             client_secret=client_secret,
-            scopes=scope,
+            **{scope_kwarg: scope},
         )
 
     from mcp.client.auth.oauth2 import OAuthClientProvider
@@ -1105,8 +1234,9 @@ def build_oauth_provider(
                 file=sys.stderr,
             )
 
-        async def callback_handler() -> tuple[str, str | None]:
-            return await anyio.to_thread.run_sync(_prompt_oauth_callback)
+        async def callback_handler():
+            code, state = await anyio.to_thread.run_sync(_prompt_oauth_callback)
+            return _authorization_code_result(code, state)
     else:
         # Reset callback handler state
         _CallbackHandler.auth_code = None
@@ -1129,7 +1259,7 @@ def build_oauth_provider(
             print(f"If browser doesn't open, visit: {auth_url}", file=sys.stderr)
             webbrowser.open(auth_url)
 
-        async def callback_handler() -> tuple[str, str | None]:
+        async def callback_handler():
             # Run the HTTP server in a thread, wait for the callback
             thread = threading.Thread(target=server.handle_request, daemon=True)
             thread.start()
@@ -1142,7 +1272,9 @@ def build_oauth_provider(
                 raise RuntimeError(f"OAuth error: {_CallbackHandler.error}")
             if not _CallbackHandler.auth_code:
                 raise RuntimeError("No authorization code received")
-            return (_CallbackHandler.auth_code, _CallbackHandler.state)
+            return _authorization_code_result(
+                _CallbackHandler.auth_code, _CallbackHandler.state
+            )
 
     return _RobustOAuthClientProvider(
         server_url=server_url,
@@ -2681,11 +2813,9 @@ def run_mcp_http(
         headers = dict(auth_headers) if auth_headers else None
 
         async def _with_streamable():
-            from mcp.client.streamable_http import streamablehttp_client
-
-            async with streamablehttp_client(
+            async with _streamable_streams(
                 url, headers=headers, auth=oauth_provider
-            ) as (read, write, _):
+            ) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     return await _mcp_session(
@@ -2863,7 +2993,7 @@ async def _mcp_session(
             {
                 "name": t.name,
                 "description": t.description or "",
-                "inputSchema": t.inputSchema or {},
+                "inputSchema": _mcp_attr(t, "inputSchema") or {},
             }
             for t in all_tools
         ]
@@ -2895,8 +3025,9 @@ async def _mcp_session(
 
     if json_output:
         # Emit the full MCP CallToolResult envelope (content, structuredContent,
-        # isError) using the SDK's own serializer — 100% MCP-compatible.
-        output_result(result.model_dump(mode="json"), pretty=pretty, head=head, json_output=True)
+        # isError) with the camelCase wire names, so the envelope does not
+        # change shape with the installed SDK major.
+        output_result(_mcp_dump(result), pretty=pretty, head=head, json_output=True)
         return
 
     text = _extract_content_parts(result.content)
@@ -2926,7 +3057,7 @@ async def _handle_resources(
                 "name": r.name,
                 "uri": str(r.uri),
                 "description": r.description or "",
-                "mimeType": r.mimeType or "",
+                "mimeType": _mcp_attr(r, "mimeType") or "",
             }
             for r in result.resources
         ]
@@ -2936,17 +3067,15 @@ async def _handle_resources(
         data = [
             {
                 "name": t.name,
-                "uriTemplate": str(t.uriTemplate),
+                "uriTemplate": str(_mcp_attr(t, "uriTemplate")),
                 "description": t.description or "",
-                "mimeType": t.mimeType or "",
+                "mimeType": _mcp_attr(t, "mimeType") or "",
             }
-            for t in result.resourceTemplates
+            for t in _mcp_attr(result, "resourceTemplates")
         ]
         output_result(data, **_out)
     elif action == "read":
-        from pydantic import AnyUrl
-
-        result = await session.read_resource(AnyUrl(uri))
+        result = await session.read_resource(_resource_uri(uri))
         parts = []
         for content in result.contents:
             if hasattr(content, "text"):
@@ -3001,7 +3130,7 @@ async def _handle_prompts(
                 messages.append({"role": msg.role, "content": content.text})
             else:
                 messages.append(
-                    {"role": msg.role, "content": json.dumps(content.model_dump())}
+                    {"role": msg.role, "content": json.dumps(_mcp_dump(content))}
                 )
         data = {"description": result.description or "", "messages": messages}
         output_result(data, **_out)
@@ -3170,9 +3299,9 @@ async def _list_all_tools(session):
     tools = []
     cursor = None
     while True:
-        result = await session.list_tools(cursor=cursor)
+        result = await _list_tools_page(session, cursor)
         tools.extend(result.tools)
-        cursor = result.nextCursor
+        cursor = _mcp_attr(result, "nextCursor")
         if not cursor:
             return tools
 
@@ -3180,7 +3309,11 @@ async def _list_all_tools(session):
 async def _dispatch_list_tools(session, params):
     tools = await _list_all_tools(session)
     return [
-        {"name": t.name, "description": t.description or "", "inputSchema": t.inputSchema or {}}
+        {
+            "name": t.name,
+            "description": t.description or "",
+            "inputSchema": _mcp_attr(t, "inputSchema") or {},
+        }
         for t in tools
     ]
 
@@ -3193,23 +3326,31 @@ async def _dispatch_call_tool(session, params):
 async def _dispatch_list_resources(session, params):
     result = await session.list_resources()
     return [
-        {"name": r.name, "uri": str(r.uri), "description": r.description or "", "mimeType": r.mimeType or ""}
+        {
+            "name": r.name,
+            "uri": str(r.uri),
+            "description": r.description or "",
+            "mimeType": _mcp_attr(r, "mimeType") or "",
+        }
         for r in result.resources
     ]
 
 
 async def _dispatch_read_resource(session, params):
-    from pydantic import AnyUrl
-
-    result = await session.read_resource(AnyUrl(params["uri"]))
+    result = await session.read_resource(_resource_uri(params["uri"]))
     return _extract_content_parts(result.contents, attrs=("text", "blob"))
 
 
 async def _dispatch_list_resource_templates(session, params):
     result = await session.list_resource_templates()
     return [
-        {"name": t.name, "uriTemplate": str(t.uriTemplate), "description": t.description or "", "mimeType": t.mimeType or ""}
-        for t in result.resourceTemplates
+        {
+            "name": t.name,
+            "uriTemplate": str(_mcp_attr(t, "uriTemplate")),
+            "description": t.description or "",
+            "mimeType": _mcp_attr(t, "mimeType") or "",
+        }
+        for t in _mcp_attr(result, "resourceTemplates")
     ]
 
 
@@ -3236,7 +3377,9 @@ async def _dispatch_get_prompt(session, params):
         if hasattr(content, "text"):
             messages.append({"role": msg.role, "content": content.text})
         else:
-            messages.append({"role": msg.role, "content": json.dumps(content.model_dump())})
+            messages.append(
+                {"role": msg.role, "content": json.dumps(_mcp_dump(content))}
+            )
     return {"description": result.description or "", "messages": messages}
 
 
@@ -3386,12 +3529,9 @@ def _run_session_daemon(config_json: str):
             headers = dict(auth_headers) if auth_headers else None
 
             async def _via_streamable():
-                from mcp.client.streamable_http import streamablehttp_client
-
-                async with streamablehttp_client(source, headers=headers) as (
+                async with _streamable_streams(source, headers=headers) as (
                     read,
                     write,
-                    _,
                 ):
                     async with ClientSession(read, write) as session:
                         await _run_with_session(session)
@@ -3668,7 +3808,7 @@ def _fetch_mcp_tools(
             {
                 "name": t.name,
                 "description": t.description or "",
-                "inputSchema": t.inputSchema or {},
+                "inputSchema": _mcp_attr(t, "inputSchema") or {},
             }
             for t in all_tools
         )
@@ -3693,11 +3833,9 @@ def _fetch_mcp_tools(
             headers = dict(auth_headers) if auth_headers else None
 
             async def _via_streamable():
-                from mcp.client.streamable_http import streamablehttp_client
-
-                async with streamablehttp_client(
+                async with _streamable_streams(
                     source, headers=headers, auth=oauth_provider
-                ) as (read, write, _):
+                ) as (read, write):
                     async with ClientSession(read, write) as session:
                         await session.initialize()
                         await _extract_tools(session)
