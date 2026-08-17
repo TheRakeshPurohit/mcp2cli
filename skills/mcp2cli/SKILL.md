@@ -68,6 +68,8 @@ Options:
   --oauth-client-id ID    OAuth client ID (supports env:/file: prefixes)
   --oauth-client-secret S OAuth client secret (supports env:/file: prefixes)
   --oauth-scope SCOPE     OAuth scope(s) to request
+  --oauth-manual-callback Print the auth URL and read the redirect URL from stdin
+                          (headless hosts: VPS over SSH, containers)
   --cache-key KEY         Custom cache key
   --cache-ttl SECONDS     Cache TTL (default: 3600)
   --refresh               Bypass cache

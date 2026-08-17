@@ -281,6 +281,30 @@ def _toon_encode(json_str: str) -> str | None:
     return None
 
 
+def _ensure_utf8_output() -> None:
+    """Make non-ASCII output safe on consoles that cannot encode it.
+
+    JSON is emitted with ``ensure_ascii=False`` (issue #62), so CJK and emoji
+    reach stdout as real characters instead of ``\\uXXXX``. On a stream whose
+    encoding cannot represent them -- a redirected pipe under a legacy
+    Windows code page such as cp936 -- ``print()`` would raise
+    ``UnicodeEncodeError`` where the old escaped output was merely ugly.
+    Prefer UTF-8; if the stream refuses to be reconfigured, degrade to
+    backslash escapes, i.e. the pre-#62 shape, rather than crashing.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8")
+        except Exception:
+            try:
+                reconfigure(errors="backslashreplace")
+            except Exception:
+                pass
+
+
 
 def _apply_head(data, n: int):
     """Truncate data to first N elements (array) or return as-is (dict/scalar)."""
@@ -680,6 +704,63 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
+def _parse_oauth_callback_input(text: str) -> tuple[str, str]:
+    """Extract ``(code, state)`` from a pasted OAuth callback URL.
+
+    Accepts the full redirect target the browser landed on
+    (``http://127.0.0.1:1234/callback?code=...&state=...``) or just its query
+    string. PKCE and CSRF verification stay in the MCP SDK -- we only hand it
+    the two values it asks for. The SDK compares ``state`` against the one it
+    generated with ``secrets.compare_digest`` and treats ``None`` as a
+    mismatch, so a paste missing ``state`` is rejected here with a readable
+    message instead of surfacing as an opaque
+    ``State parameter mismatch: None != ...``.
+    """
+    text = text.strip().strip("'\"")
+    if not text:
+        raise ValueError("No callback URL provided.")
+    params = parse_qs(urlparse(text).query or text)
+    if "error" in params:
+        detail = params.get("error_description", [""])[0]
+        suffix = f" ({detail})" if detail else ""
+        raise RuntimeError(f"OAuth error: {params['error'][0]}{suffix}")
+    if "code" not in params:
+        raise ValueError(
+            "That URL has no 'code' parameter. Paste the entire URL from the "
+            "browser's address bar, including everything after the '?'."
+        )
+    if "state" not in params:
+        raise ValueError(
+            "That URL has no 'state' parameter. Paste the URL unmodified -- "
+            "the MCP SDK verifies state to prevent CSRF and rejects a missing one."
+        )
+    return params["code"][0], params["state"][0]
+
+
+def _prompt_oauth_callback(attempts: int = 3) -> tuple[str, str]:
+    """Read the OAuth callback URL from stdin.
+
+    For hosts with no reachable browser -- a VPS over SSH, a container.
+    Blocking, so callers run it off the event loop via ``anyio.to_thread``.
+    A malformed paste is re-prompted rather than fatal: the authorization
+    code is still live, and losing it would mean restarting the whole flow.
+    """
+    for remaining in reversed(range(attempts)):
+        print("Paste the full callback URL here: ", end="", file=sys.stderr, flush=True)
+        line = sys.stdin.readline()
+        if not line:
+            raise RuntimeError(
+                "stdin closed before an OAuth callback URL was pasted; "
+                "--oauth-manual-callback needs an interactive terminal."
+            )
+        try:
+            return _parse_oauth_callback_input(line)
+        except ValueError as exc:
+            if not remaining:
+                raise
+            print(f"{exc} ({remaining} attempt(s) left)", file=sys.stderr)
+
+
 
 
 def _get_cached_redirect_uri(storage: "FileTokenStorage") -> str | None:
@@ -745,6 +826,7 @@ def build_oauth_provider(
     scope: str | None = None,
     redirect_uri: str | None = None,
     flow: str = "auto",
+    manual_callback: bool = False,
 ) -> "httpx.Auth":
     """Build an OAuth provider for HTTP connections.
 
@@ -763,6 +845,10 @@ def build_oauth_provider(
 
     redirect_uri controls the full callback URL (scheme, host, port, path).
     When None, defaults to http://127.0.0.1:<random-free-port>/callback.
+
+    manual_callback skips the local callback server entirely and reads the
+    redirect URL from stdin instead, for hosts where the browser runs on a
+    different machine (issue #71).
     """
     storage = FileTokenStorage(server_url)
 
@@ -1001,41 +1087,62 @@ def build_oauth_provider(
         )
         storage._client_path.write_text(pre_client_info.model_dump_json())
 
-    # Reset callback handler state
-    _CallbackHandler.auth_code = None
-    _CallbackHandler.state = None
-    _CallbackHandler.error = None
-    _CallbackHandler.done = threading.Event()
+    if manual_callback:
+        # Nothing on this host can receive the redirect (e.g. a VPS reached
+        # over SSH), so print the URL for a browser elsewhere and take the
+        # redirect back by hand. The loopback redirect_uri is still what gets
+        # registered and sent, so the remote browser's final URL carries
+        # code+state even though no listener exists on that port. (Issue #71.)
+        async def redirect_handler(auth_url: str) -> None:
+            print(
+                "Open this URL in a browser on any machine and authorize:",
+                file=sys.stderr,
+            )
+            print(f"\n{auth_url}\n", file=sys.stderr)
+            print(
+                "The page you land on will fail to load -- that is expected, "
+                "nothing is listening there. Only its URL matters.",
+                file=sys.stderr,
+            )
 
-    if callback_host == "::1":
-        import socket as _socket
-
-        class _IPv6HTTPServer(HTTPServer):
-            address_family = _socket.AF_INET6
-
-        server = _IPv6HTTPServer((callback_host, port), _CallbackHandler)
+        async def callback_handler() -> tuple[str, str | None]:
+            return await anyio.to_thread.run_sync(_prompt_oauth_callback)
     else:
-        server = HTTPServer((callback_host, port), _CallbackHandler)
+        # Reset callback handler state
+        _CallbackHandler.auth_code = None
+        _CallbackHandler.state = None
+        _CallbackHandler.error = None
+        _CallbackHandler.done = threading.Event()
 
-    async def redirect_handler(auth_url: str) -> None:
-        print("Opening browser for authorization...", file=sys.stderr)
-        print(f"If browser doesn't open, visit: {auth_url}", file=sys.stderr)
-        webbrowser.open(auth_url)
+        if callback_host == "::1":
+            import socket as _socket
 
-    async def callback_handler() -> tuple[str, str | None]:
-        # Run the HTTP server in a thread, wait for the callback
-        thread = threading.Thread(target=server.handle_request, daemon=True)
-        thread.start()
-        # Wait with timeout
-        if not _CallbackHandler.done.wait(timeout=300):
+            class _IPv6HTTPServer(HTTPServer):
+                address_family = _socket.AF_INET6
+
+            server = _IPv6HTTPServer((callback_host, port), _CallbackHandler)
+        else:
+            server = HTTPServer((callback_host, port), _CallbackHandler)
+
+        async def redirect_handler(auth_url: str) -> None:
+            print("Opening browser for authorization...", file=sys.stderr)
+            print(f"If browser doesn't open, visit: {auth_url}", file=sys.stderr)
+            webbrowser.open(auth_url)
+
+        async def callback_handler() -> tuple[str, str | None]:
+            # Run the HTTP server in a thread, wait for the callback
+            thread = threading.Thread(target=server.handle_request, daemon=True)
+            thread.start()
+            # Wait with timeout
+            if not _CallbackHandler.done.wait(timeout=300):
+                server.server_close()
+                raise TimeoutError("OAuth callback timed out after 5 minutes")
             server.server_close()
-            raise TimeoutError("OAuth callback timed out after 5 minutes")
-        server.server_close()
-        if _CallbackHandler.error:
-            raise RuntimeError(f"OAuth error: {_CallbackHandler.error}")
-        if not _CallbackHandler.auth_code:
-            raise RuntimeError("No authorization code received")
-        return (_CallbackHandler.auth_code, _CallbackHandler.state)
+            if _CallbackHandler.error:
+                raise RuntimeError(f"OAuth error: {_CallbackHandler.error}")
+            if not _CallbackHandler.auth_code:
+                raise RuntimeError("No authorization code received")
+            return (_CallbackHandler.auth_code, _CallbackHandler.state)
 
     return _RobustOAuthClientProvider(
         server_url=server_url,
@@ -1937,6 +2044,8 @@ def _baked_to_argv(config: dict) -> list[str]:
         argv += ["--oauth-redirect-uri", config["oauth_redirect_uri"]]
     if config.get("oauth_flow") and config["oauth_flow"] != "auto":
         argv += ["--oauth-flow", config["oauth_flow"]]
+    if config.get("oauth_manual_callback"):
+        argv.append("--oauth-manual-callback")
     return argv
 
 
@@ -1994,6 +2103,7 @@ def _bake_create(argv: list[str]) -> None:
     p.add_argument("--oauth-client-name", default="mcp2cli")
     p.add_argument("--oauth-scope", default=None)
     p.add_argument("--oauth-redirect-uri", default=None, metavar="URI")
+    p.add_argument("--oauth-manual-callback", action="store_true")
     p.add_argument(
         "--oauth-flow",
         choices=["auto", "authorization_code", "client_credentials"],
@@ -2061,6 +2171,7 @@ def _bake_create(argv: list[str]) -> None:
         "oauth_scope": args.oauth_scope,
         "oauth_redirect_uri": args.oauth_redirect_uri,
         "oauth_flow": args.oauth_flow,
+        "oauth_manual_callback": args.oauth_manual_callback,
         "include": [x.strip() for x in args.include.split(",") if x.strip()],
         "exclude": [x.strip() for x in args.exclude.split(",") if x.strip()],
         "methods": [x.strip().upper() for x in args.methods.split(",") if x.strip()],
@@ -3665,6 +3776,7 @@ def _split_at_subcommand(
 
 
 def main():
+    _ensure_utf8_output()
     if len(sys.argv) > 1:
         first = sys.argv[1]
         if first == "bake":
@@ -3840,6 +3952,13 @@ def _build_main_parser() -> argparse.ArgumentParser:
             "client secret (required for confidential-client servers like Slack)."
         ),
     )
+    pre.add_argument(
+        "--oauth-manual-callback",
+        action="store_true",
+        help="Don't run a local callback server; print the authorization URL and read "
+             "the redirect URL back from stdin. For hosts with no reachable browser, "
+             "e.g. a VPS over SSH.",
+    )
     # Resource flags
     pre.add_argument(
         "--list-resources", action="store_true", help="List available resources"
@@ -3969,6 +4088,7 @@ def _setup_oauth(pre_args):
         scope=pre_args.oauth_scope,
         redirect_uri=pre_args.oauth_redirect_uri,
         flow=flow,
+        manual_callback=getattr(pre_args, "oauth_manual_callback", False),
     )
 
 

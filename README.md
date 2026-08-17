@@ -83,6 +83,22 @@ mcp2cli --spec ./openapi.json --base-url https://api.example.com --oauth --list
 Tokens are persisted in `~/.cache/mcp2cli/oauth/` so subsequent calls reuse existing tokens
 and refresh automatically when they expire.
 
+#### Headless hosts — no browser on the machine running mcp2cli
+
+The default authorization-code flow starts a callback server on `127.0.0.1`, which only
+works when the browser runs on the same machine. On a VPS over SSH or in a container,
+add `--oauth-manual-callback`: mcp2cli prints the authorization URL instead of opening a
+browser, and reads the redirect back from stdin.
+
+```bash
+mcp2cli --mcp https://mcp.linear.app/mcp --oauth --oauth-manual-callback --list
+```
+
+Open the printed URL in a browser on any machine, authorize, then paste the URL you land
+on. That page will fail to load — nothing is listening on the loopback port — which is
+expected; only its address matters, because it carries the `code` and `state` parameters.
+PKCE and state verification are unchanged, so paste the URL unmodified.
+
 ### Secrets from environment or files
 
 Sensitive values (`--auth-header` values, `--oauth-client-id`, `--oauth-client-secret`) support
@@ -307,6 +323,8 @@ Options:
   --oauth-client-id ID    OAuth client ID (supports env:/file: prefixes)
   --oauth-client-secret S OAuth client secret (supports env:/file: prefixes)
   --oauth-scope SCOPE     OAuth scope(s) to request
+  --oauth-manual-callback Print the auth URL and read the redirect from stdin
+                          (for hosts with no reachable browser)
   --cache-key KEY         Custom cache key
   --cache-ttl SECONDS     Cache TTL (default: 3600)
   --refresh               Bypass cache
