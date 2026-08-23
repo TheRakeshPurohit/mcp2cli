@@ -38,6 +38,8 @@ CACHE_DIR = Path(
     os.environ.get("MCP2CLI_CACHE_DIR", Path.home() / ".cache" / "mcp2cli")
 )
 DEFAULT_CACHE_TTL = 3600
+# Client-side capability the user opted into (see --root).
+_ROOTS: list[str] = []
 USAGE_FILE = CACHE_DIR / "usage.json"
 CONFIG_DIR = Path(
     os.environ.get("MCP2CLI_CONFIG_DIR", Path.home() / ".config" / "mcp2cli")
@@ -2884,6 +2886,29 @@ def _run_mcp_clean(fn, source: str):
         sys.exit(1)
 
 
+def _roots_callback():
+    """Answer ``roots/list`` from --root, or None when none were given.
+
+    Servers that scope themselves to a workspace (filesystem, git, IDE-style
+    servers) ask the client for roots and fall back to something narrower when
+    the client offers none — the filesystem server literally logs "Client does
+    not support MCP Roots".
+    """
+    if not _ROOTS:
+        return None
+
+    from mcp import types
+
+    async def list_roots(context=None):
+        roots = []
+        for raw in _ROOTS:
+            uri = raw if "://" in raw else Path(raw).expanduser().resolve().as_uri()
+            roots.append(types.Root(uri=uri, name=Path(raw).name or uri))
+        return types.ListRootsResult(roots=roots)
+
+    return list_roots
+
+
 def run_mcp_http(
     url: str,
     auth_headers: list[tuple[str, str]],
@@ -2903,6 +2928,7 @@ def run_mcp_http(
     prompt_action: str | None = None,
     prompt_name: str | None = None,
     prompt_arguments: dict | None = None,
+    complete_spec: str | None = None,
     search_pattern: str | None = None,
     head: int | None = None,
     verbose: bool = False,
@@ -2918,6 +2944,7 @@ def run_mcp_http(
         prompt_action=prompt_action,
         prompt_name=prompt_name,
         prompt_arguments=prompt_arguments,
+        complete_spec=complete_spec,
         search_pattern=search_pattern,
         head=head,
         verbose=verbose,
@@ -2937,7 +2964,7 @@ def run_mcp_http(
             async with _streamable_streams(
                 url, headers=headers, auth=oauth_provider
             ) as (read, write):
-                async with ClientSession(read, write) as session:
+                async with ClientSession(read, write, list_roots_callback=_roots_callback()) as session:
                     await session.initialize()
                     return await _mcp_session(
                         session,
@@ -2960,7 +2987,7 @@ def run_mcp_http(
                 read,
                 write,
             ):
-                async with ClientSession(read, write) as session:
+                async with ClientSession(read, write, list_roots_callback=_roots_callback()) as session:
                     await session.initialize()
                     return await _mcp_session(
                         session,
@@ -3008,6 +3035,7 @@ def run_mcp_stdio(
     prompt_action: str | None = None,
     prompt_name: str | None = None,
     prompt_arguments: dict | None = None,
+    complete_spec: str | None = None,
     search_pattern: str | None = None,
     head: int | None = None,
     verbose: bool = False,
@@ -3023,6 +3051,7 @@ def run_mcp_stdio(
         prompt_action=prompt_action,
         prompt_name=prompt_name,
         prompt_arguments=prompt_arguments,
+        complete_spec=complete_spec,
         search_pattern=search_pattern,
         head=head,
         verbose=verbose,
@@ -3044,7 +3073,7 @@ def run_mcp_stdio(
         params = StdioServerParameters(command=parts[0], args=parts[1:], env=env)
 
         async with stdio_client(params) as (read, write):
-            async with ClientSession(read, write) as session:
+            async with ClientSession(read, write, list_roots_callback=_roots_callback()) as session:
                 await session.initialize()
                 return await _mcp_session(
                     session,
@@ -3081,6 +3110,7 @@ async def _mcp_session(
     prompt_action: str | None = None,
     prompt_name: str | None = None,
     prompt_arguments: dict | None = None,
+    complete_spec: str | None = None,
     search_pattern: str | None = None,
     head: int | None = None,
     verbose: bool = False,
@@ -3090,6 +3120,14 @@ async def _mcp_session(
     source_hash: str = "",
     json_output: bool = False,
 ):
+    # Handle completion requests
+    if complete_spec:
+        await _handle_completion(
+            session, complete_spec, pretty, raw, toon, head=head,
+            json_output=json_output,
+        )
+        return
+
     # Handle resource operations
     if resource_action:
         await _handle_resources(
@@ -3230,6 +3268,62 @@ async def _handle_resources(
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
+
+
+def parse_complete_spec(spec: str) -> tuple[str, str, str]:
+    """Parse ``REF:ARG=PREFIX`` into (ref, argument, prefix).
+
+    ``REF`` is a prompt name, or a resource URI template when it contains
+    ``://`` — in which case the scheme's own colons must not be mistaken for
+    the ref/arg separator.
+    """
+    ref_part, sep, prefix = spec.partition("=")
+    if not sep:
+        print(
+            "Error: --complete expects REF:ARG=PREFIX (e.g. 'my-prompt:city=San')",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    ref, sep, argument = ref_part.rpartition(":")
+    if not sep or not ref or not argument:
+        print(
+            f"Error: --complete could not split {ref_part!r} into REF:ARG",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return ref, argument, prefix
+
+
+async def _handle_completion(
+    session,
+    spec: str,
+    pretty: bool,
+    raw: bool,
+    toon: bool,
+    head: int | None = None,
+    json_output: bool = False,
+):
+    """Run ``completion/complete`` for a prompt or resource-template argument."""
+    from mcp import types
+
+    ref_name, argument, prefix = parse_complete_spec(spec)
+    if "://" in ref_name or "{" in ref_name:
+        ref = types.ResourceTemplateReference(
+            type="ref/resource", uri=ref_name
+        )
+    else:
+        ref = types.PromptReference(type="ref/prompt", name=ref_name)
+
+    result = await session.complete(ref, {"name": argument, "value": prefix})
+    completion = getattr(result, "completion", None)
+    data = {
+        "values": list(getattr(completion, "values", []) or []),
+        "total": getattr(completion, "total", None),
+        "hasMore": getattr(completion, "has_more", None),
+    }
+    output_result(
+        data, pretty=pretty, raw=raw, toon=toon, head=head, json_output=json_output
+    )
 
 
 async def _handle_prompts(
@@ -3676,7 +3770,7 @@ def _run_session_daemon(config_json: str):
             env = {**os.environ, **env_vars}
             params = StdioServerParameters(command=parts[0], args=parts[1:], env=env)
             async with stdio_client(params) as (read, write):
-                async with ClientSession(read, write) as session:
+                async with ClientSession(read, write, list_roots_callback=_roots_callback()) as session:
                     await _run_with_session(session)
         else:
             headers = dict(auth_headers) if auth_headers else None
@@ -3686,14 +3780,14 @@ def _run_session_daemon(config_json: str):
                     read,
                     write,
                 ):
-                    async with ClientSession(read, write) as session:
+                    async with ClientSession(read, write, list_roots_callback=_roots_callback()) as session:
                         await _run_with_session(session)
 
             async def _via_sse():
                 from mcp.client.sse import sse_client
 
                 async with sse_client(source, headers=headers) as (read, write):
-                    async with ClientSession(read, write) as session:
+                    async with ClientSession(read, write, list_roots_callback=_roots_callback()) as session:
                         await _run_with_session(session)
 
             if transport == "sse":
@@ -3821,6 +3915,7 @@ def handle_mcp(
     prompt_action: str | None = None,
     prompt_name: str | None = None,
     prompt_arguments: dict | None = None,
+    complete_spec: str | None = None,
     search_pattern: str | None = None,
     bake_config: BakeConfig | None = None,
     head: int | None = None,
@@ -3842,14 +3937,15 @@ def handle_mcp(
     key = cache_key_override or cache_key_for(config_for_cache)
     src_hash = _source_hash_for(source)
 
-    # Resource/prompt operations skip the tool flow entirely
-    if resource_action or prompt_action:
+    # Resource/prompt/completion operations skip the tool flow entirely
+    if resource_action or prompt_action or complete_spec:
         extra = dict(
             resource_action=resource_action,
             resource_uri=resource_uri,
             prompt_action=prompt_action,
             prompt_name=prompt_name,
             prompt_arguments=prompt_arguments,
+            complete_spec=complete_spec,
             head=head,
             json_output=json_output,
         )
@@ -3977,7 +4073,7 @@ def _fetch_mcp_tools(
             env = {**os.environ, **env_vars}
             params = StdioServerParameters(command=parts[0], args=parts[1:], env=env)
             async with stdio_client(params) as (read, write):
-                async with ClientSession(read, write) as session:
+                async with ClientSession(read, write, list_roots_callback=_roots_callback()) as session:
                     await session.initialize()
                     await _extract_tools(session)
         else:
@@ -3989,7 +4085,7 @@ def _fetch_mcp_tools(
                 async with _streamable_streams(
                     source, headers=headers, auth=oauth_provider
                 ) as (read, write):
-                    async with ClientSession(read, write) as session:
+                    async with ClientSession(read, write, list_roots_callback=_roots_callback()) as session:
                         await session.initialize()
                         await _extract_tools(session)
 
@@ -4000,7 +4096,7 @@ def _fetch_mcp_tools(
                     read,
                     write,
                 ):
-                    async with ClientSession(read, write) as session:
+                    async with ClientSession(read, write, list_roots_callback=_roots_callback()) as session:
                         await session.initialize()
                         await _extract_tools(session)
 
@@ -4198,6 +4294,26 @@ def _build_main_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="Environment variable KEY=VALUE for MCP stdio (repeatable)",
+    )
+    pre.add_argument(
+        "--root",
+        action="append",
+        default=[],
+        metavar="PATH|URI",
+        help=(
+            "Expose a filesystem root to the server (repeatable). Servers that "
+            "scope themselves to a workspace ask for these via roots/list."
+        ),
+    )
+    pre.add_argument(
+        "--complete",
+        default=None,
+        metavar="REF:ARG=PREFIX",
+        help=(
+            "Ask the server to complete an argument value, e.g. "
+            "--complete 'my-prompt:city=San'. REF is a prompt name, or a "
+            "resource URI template when it contains '://'."
+        ),
     )
     pre.add_argument(
         "--oauth",
@@ -4693,6 +4809,9 @@ def _main_impl(argv: list[str], bake_config: BakeConfig | None = None):
     pre_args, leftover = pre.parse_known_args(global_argv)
     remaining = leftover + tool_argv
 
+    if pre_args.root:
+        _ROOTS[:] = pre_args.root
+
     # --search implies --list
     search_pattern = pre_args.search_pattern
     if search_pattern:
@@ -4764,6 +4883,7 @@ def _main_impl(argv: list[str], bake_config: BakeConfig | None = None):
             prompt_action=prompt_action,
             prompt_name=prompt_name,
             prompt_arguments=prompt_arguments,
+            complete_spec=pre_args.complete,
             search_pattern=search_pattern,
             bake_config=bake_config,
             head=pre_args.head,
