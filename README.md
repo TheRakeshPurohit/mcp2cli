@@ -139,6 +139,30 @@ mcp2cli --mcp-stdio "node server.js" --env API_KEY=sk-... --env DEBUG=1 \
   search --query "test"
 ```
 
+### MCP roots and completion
+
+Expose one or more filesystem roots when a server scopes operations to a
+workspace. Paths are converted to `file://` URIs; explicit roots must also use
+the `file://` scheme.
+
+```bash
+mcp2cli --mcp-stdio "npx @modelcontextprotocol/server-filesystem /tmp" \
+  --root "$PWD" --root file:///var/shared --list
+```
+
+Request prompt-argument or resource-template completions with
+`REF:ARG=PREFIX`:
+
+```bash
+mcp2cli --mcp https://example.com/mcp \
+  --complete "greeting:name=San"
+mcp2cli --mcp https://example.com/mcp \
+  --complete "file:///docs/{topic}:topic=api"
+```
+
+Both options work when starting a persistent session; roots are retained by
+the session daemon and completion requests can be sent through `--session`.
+
 ### OpenAPI mode
 
 ```bash
@@ -319,6 +343,8 @@ Options:
   --base-url URL          Override base URL from spec
   --transport TYPE        MCP HTTP transport: auto|sse|streamable (default: auto)
   --env KEY=VALUE         Env var for MCP stdio server (repeatable)
+  --root PATH|FILE_URI    Expose a filesystem root to an MCP server (repeatable)
+  --complete SPEC         Complete an MCP prompt or resource-template argument
   --oauth                 Enable OAuth (authorization code + PKCE flow)
   --oauth-client-id ID    OAuth client ID (supports env:/file: prefixes)
   --oauth-client-secret S OAuth client secret (supports env:/file: prefixes)

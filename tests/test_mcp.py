@@ -262,6 +262,39 @@ class TestMCPStdio:
         # Default name should be "World"
         assert "World" in data["messages"][0]["content"]
 
+    # --- Roots and completion ---
+
+    def test_roots_are_exposed_to_server(self):
+        r = self._run(
+            "--refresh",
+            "--root",
+            "/tmp/workspace",
+            "--root",
+            "file:///var/project",
+            "client-roots",
+        )
+        assert r.returncode == 0
+        roots = json.loads(r.stdout)
+        assert {root["uri"] for root in roots} == {
+            "file:///tmp/workspace",
+            "file:///var/project",
+        }
+        assert {root["name"] for root in roots} == {"workspace", "project"}
+
+    def test_invalid_root_uri_fails_before_connecting(self):
+        r = self._run("--root", "https://example.com/workspace", "--list")
+        assert r.returncode != 0
+        assert "--root expects a filesystem path or file:// URI" in r.stderr
+
+    def test_complete_prompt_argument(self):
+        r = self._run("--complete", "greeting:name=San")
+        assert r.returncode == 0
+        assert json.loads(r.stdout) == {
+            "values": ["San Diego", "San Francisco"],
+            "total": 3,
+            "hasMore": True,
+        }
+
 
 class TestMCPHTTP:
     """Tests for MCP HTTP transport.
@@ -361,6 +394,10 @@ class TestSessions:
                 "mcp2cli",
                 "--mcp-stdio",
                 server,
+                "--root",
+                "/tmp/workspace",
+                "--root",
+                "file:///var/project",
                 "--session-start",
                 name,
             ],
@@ -440,6 +477,49 @@ class TestSessions:
             assert r.returncode == 0
             data = json.loads(r.stdout)
             assert any(d["name"] == "greeting" for d in data)
+
+            # Completion via session
+            r = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "mcp2cli",
+                    "--session",
+                    name,
+                    "--complete",
+                    "greeting:name=San",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert r.returncode == 0
+            assert json.loads(r.stdout) == {
+                "values": ["San Diego", "San Francisco"],
+                "total": 3,
+                "hasMore": True,
+            }
+
+            # Roots survive serialization into the session daemon
+            r = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "mcp2cli",
+                    "--session",
+                    name,
+                    "client-roots",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert r.returncode == 0
+            roots = json.loads(r.stdout)
+            assert {root["uri"] for root in roots} == {
+                "file:///tmp/workspace",
+                "file:///var/project",
+            }
 
         finally:
             # Stop
