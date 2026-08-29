@@ -94,6 +94,11 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "client_roots",
+        "description": "Return roots exposed by the connected client",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 RESOURCES = [
@@ -240,13 +245,31 @@ def _get_prompt(name: str, arguments: dict) -> dict:
     raise _Error(f"Unknown prompt: {name}")
 
 
+def _complete(params: dict) -> dict:
+    prefix = (params.get("argument") or {}).get("value", "")
+    candidates = ["San Diego", "San Francisco", "San Jose"]
+    matches = [value for value in candidates if value.startswith(prefix)]
+    return {
+        "completion": {
+            "values": matches[:2],
+            "total": len(matches),
+            "hasMore": len(matches) > 2,
+        }
+    }
+
+
 def _result(method: str, params: dict) -> dict:
     if method == "initialize":
         # Echo the client's protocol version back rather than pinning one, so
         # this double stays valid as the SDK advances its LATEST_PROTOCOL_VERSION.
         return {
             "protocolVersion": params.get("protocolVersion", "2025-06-18"),
-            "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
+            "capabilities": {
+                "tools": {},
+                "resources": {},
+                "prompts": {},
+                "completions": {},
+            },
             "serverInfo": {"name": SERVER_NAME, "version": "1.0.0"},
         }
     if method == "ping":
@@ -265,6 +288,8 @@ def _result(method: str, params: dict) -> dict:
         return {"prompts": PROMPTS}
     if method == "prompts/get":
         return _get_prompt(params.get("name", ""), params.get("arguments") or {})
+    if method == "completion/complete":
+        return _complete(params)
     raise _Error(f"Method not found: {method}", METHOD_NOT_FOUND)
 
 

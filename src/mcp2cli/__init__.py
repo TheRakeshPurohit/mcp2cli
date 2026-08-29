@@ -324,6 +324,7 @@ _MCP_RENAMED_FIELDS = {
     "mimeType": "mime_type",
     "structuredContent": "structured_content",
     "isError": "is_error",
+    "hasMore": "has_more",
 }
 
 
@@ -2886,24 +2887,41 @@ def _run_mcp_clean(fn, source: str):
         sys.exit(1)
 
 
-def _roots_callback():
-    """Answer ``roots/list`` from --root, or None when none were given.
+def _normalize_root(raw: str) -> str:
+    """Return a validated file URI for one ``--root`` value."""
+    if "://" in raw:
+        if not raw.casefold().startswith("file://"):
+            raise ValueError(
+                f"--root expects a filesystem path or file:// URI, got {raw!r}"
+            )
+        uri = raw
+    else:
+        uri = Path(raw).expanduser().resolve().as_uri()
 
-    Servers that scope themselves to a workspace (filesystem, git, IDE-style
-    servers) ask the client for roots and fall back to something narrower when
-    the client offers none — the filesystem server literally logs "Client does
-    not support MCP Roots".
-    """
-    if not _ROOTS:
+    from mcp import types
+
+    try:
+        return str(types.Root(uri=uri).uri)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid --root value {raw!r}: {exc}") from exc
+
+
+def _roots_callback(root_uris: list[str] | None = None):
+    """Answer ``roots/list`` from validated file URIs, if any were given."""
+    configured_roots = tuple(_ROOTS if root_uris is None else root_uris)
+    if not configured_roots:
         return None
 
     from mcp import types
 
     async def list_roots(context=None):
-        roots = []
-        for raw in _ROOTS:
-            uri = raw if "://" in raw else Path(raw).expanduser().resolve().as_uri()
-            roots.append(types.Root(uri=uri, name=Path(raw).name or uri))
+        roots = [
+            types.Root(
+                uri=uri,
+                name=Path(urlparse(uri).path).name or uri,
+            )
+            for uri in configured_roots
+        ]
         return types.ListRootsResult(roots=roots)
 
     return list_roots
@@ -3294,16 +3312,8 @@ def parse_complete_spec(spec: str) -> tuple[str, str, str]:
     return ref, argument, prefix
 
 
-async def _handle_completion(
-    session,
-    spec: str,
-    pretty: bool,
-    raw: bool,
-    toon: bool,
-    head: int | None = None,
-    json_output: bool = False,
-):
-    """Run ``completion/complete`` for a prompt or resource-template argument."""
+async def _completion_data(session, spec: str) -> dict:
+    """Run ``completion/complete`` and return its stable wire-shaped payload."""
     from mcp import types
 
     ref_name, argument, prefix = parse_complete_spec(spec)
@@ -3315,12 +3325,25 @@ async def _handle_completion(
         ref = types.PromptReference(type="ref/prompt", name=ref_name)
 
     result = await session.complete(ref, {"name": argument, "value": prefix})
-    completion = getattr(result, "completion", None)
-    data = {
-        "values": list(getattr(completion, "values", []) or []),
-        "total": getattr(completion, "total", None),
-        "hasMore": getattr(completion, "has_more", None),
+    completion = result.completion
+    return {
+        "values": list(completion.values or []),
+        "total": completion.total,
+        "hasMore": _mcp_attr(completion, "hasMore"),
     }
+
+
+async def _handle_completion(
+    session,
+    spec: str,
+    pretty: bool,
+    raw: bool,
+    toon: bool,
+    head: int | None = None,
+    json_output: bool = False,
+):
+    """Run ``completion/complete`` for a prompt or resource-template argument."""
+    data = await _completion_data(session, spec)
     output_result(
         data, pretty=pretty, raw=raw, toon=toon, head=head, json_output=json_output
     )
@@ -3448,6 +3471,7 @@ def session_start(
     auth_headers: list[tuple[str, str]],
     env_vars: dict[str, str],
     transport: str = "auto",
+    roots: list[str] | None = None,
 ):
     """Start a persistent session daemon."""
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -3478,6 +3502,7 @@ def session_start(
             "auth_headers": auth_headers,
             "env_vars": env_vars,
             "transport": transport,
+            "roots": list(roots or []),
         }
     )
 
@@ -3630,6 +3655,10 @@ async def _dispatch_get_prompt(session, params):
     return {"description": result.description or "", "messages": messages}
 
 
+async def _dispatch_complete(session, params):
+    return await _completion_data(session, params["spec"])
+
+
 _SESSION_DISPATCH = {
     "list_tools": _dispatch_list_tools,
     "call_tool": _dispatch_call_tool,
@@ -3638,6 +3667,7 @@ _SESSION_DISPATCH = {
     "list_resource_templates": _dispatch_list_resource_templates,
     "list_prompts": _dispatch_list_prompts,
     "get_prompt": _dispatch_get_prompt,
+    "complete": _dispatch_complete,
 }
 
 
@@ -3650,6 +3680,7 @@ def _run_session_daemon(config_json: str):
     auth_headers = [tuple(h) for h in config["auth_headers"]]
     env_vars = config["env_vars"]
     transport = config["transport"]
+    roots = config.get("roots", [])
 
     sock_path = _session_sock_path(name)
     meta_path = _session_meta_path(name)
@@ -3770,7 +3801,7 @@ def _run_session_daemon(config_json: str):
             env = {**os.environ, **env_vars}
             params = StdioServerParameters(command=parts[0], args=parts[1:], env=env)
             async with stdio_client(params) as (read, write):
-                async with ClientSession(read, write, list_roots_callback=_roots_callback()) as session:
+                async with ClientSession(read, write, list_roots_callback=_roots_callback(roots)) as session:
                     await _run_with_session(session)
         else:
             headers = dict(auth_headers) if auth_headers else None
@@ -3780,14 +3811,14 @@ def _run_session_daemon(config_json: str):
                     read,
                     write,
                 ):
-                    async with ClientSession(read, write, list_roots_callback=_roots_callback()) as session:
+                    async with ClientSession(read, write, list_roots_callback=_roots_callback(roots)) as session:
                         await _run_with_session(session)
 
             async def _via_sse():
                 from mcp.client.sse import sse_client
 
                 async with sse_client(source, headers=headers) as (read, write):
-                    async with ClientSession(read, write, list_roots_callback=_roots_callback()) as session:
+                    async with ClientSession(read, write, list_roots_callback=_roots_callback(roots)) as session:
                         await _run_with_session(session)
 
             if transport == "sse":
@@ -4299,10 +4330,10 @@ def _build_main_parser() -> argparse.ArgumentParser:
         "--root",
         action="append",
         default=[],
-        metavar="PATH|URI",
+        metavar="PATH|FILE_URI",
         help=(
-            "Expose a filesystem root to the server (repeatable). Servers that "
-            "scope themselves to a workspace ask for these via roots/list."
+            "Expose a filesystem path or file:// URI to the server (repeatable). "
+            "Workspace-scoped servers request these via roots/list."
         ),
     )
     pre.add_argument(
@@ -4542,6 +4573,7 @@ def _handle_session_operations(
             auth_headers,
             env_vars,
             transport=pre_args.transport,
+            roots=_ROOTS,
         )
         return True
 
@@ -4554,6 +4586,13 @@ def _handle_session_operations(
         pretty=pre_args.pretty, raw=pre_args.raw, toon=pre_args.toon,
         json_output=pre_args.json_output,
     )
+    if pre_args.complete:
+        result = _session_request(
+            sess_name, "complete", {"spec": pre_args.complete}
+        )
+        output_result(result, head=pre_args.head, **_sess_out)
+        return True
+
 
     if pre_args.list_resources:
         result = _session_request(sess_name, "list_resources")
@@ -4809,8 +4848,11 @@ def _main_impl(argv: list[str], bake_config: BakeConfig | None = None):
     pre_args, leftover = pre.parse_known_args(global_argv)
     remaining = leftover + tool_argv
 
-    if pre_args.root:
-        _ROOTS[:] = pre_args.root
+    try:
+        _ROOTS[:] = [_normalize_root(raw) for raw in pre_args.root]
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     # --search implies --list
     search_pattern = pre_args.search_pattern
