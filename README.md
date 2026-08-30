@@ -416,7 +416,3 @@ protocol directly and import no SDK, so they hold across majors.
 ## License
 
 [MIT](LICENSE)
-
----
-
-<sub>mcp2cli builds on ideas from [CLIHub](https://kanyilmaz.me/2026/02/23/cli-vs-mcp.html) by Kagan Yilmaz (CLI-based tool access for token efficiency)</sub>
